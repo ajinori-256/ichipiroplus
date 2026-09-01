@@ -227,6 +227,12 @@ interface SendPushNotificationParams {
   body: string;
   url?: string;
   notificationType: NotificationType;
+  preloadedSubscriptions?: Array<{
+    id: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+  }>;
 }
 
 export const sendPushNotification = async ({
@@ -235,6 +241,7 @@ export const sendPushNotification = async ({
   body,
   url = "/",
   notificationType,
+  preloadedSubscriptions,
 }: SendPushNotificationParams): Promise<{
   success: number;
   failed: number;
@@ -243,27 +250,31 @@ export const sendPushNotification = async ({
   const results = { success: 0, failed: 0, errors: [] as string[] };
 
   try {
-    // ユーザーの通知設定に応じてサブスクリプションをフィルタリング
-    const whereClause: Record<string, boolean | string> = { userId };
+    let subscriptions: Array<{
+      id: string;
+      endpoint: string;
+      p256dh: string;
+      auth: string;
+    }>;
 
-    if (notificationType === "task") {
-      whereClause.taskReminders = true;
-    } else if (notificationType === "lecture") {
-      whereClause.lectureStarts = true;
-    } else if (notificationType === "system") {
-      whereClause.systemNotices = true;
+    if (preloadedSubscriptions) {
+      subscriptions = preloadedSubscriptions;
+    } else {
+      const whereClause: Record<string, boolean | string> = { userId };
+      if (notificationType === "task") whereClause.taskReminders = true;
+      else if (notificationType === "lecture") whereClause.lectureStarts = true;
+      else if (notificationType === "system") whereClause.systemNotices = true;
+
+      subscriptions = await prisma.pushSubscription.findMany({
+        where: whereClause,
+      });
     }
-
-    const subscriptions = await prisma.pushSubscription.findMany({
-      where: whereClause,
-    });
 
     if (subscriptions.length === 0) {
       results.errors.push("No active subscriptions found");
       return results;
     }
 
-    // 送信するデータ
     const payload = JSON.stringify({
       title,
       body,
@@ -272,65 +283,64 @@ export const sendPushNotification = async ({
       timestamp: Date.now(),
     });
 
-    // 各サブスクリプションに通知を送信
+    const successLogs: Array<{
+      userId: string;
+      title: string;
+      body: string;
+      url: string;
+      notificationType: NotificationType;
+      status: "sent";
+    }> = [];
+    const invalidSubscriptionIds: string[] = [];
+    const errorLogs: Array<{
+      userId: string;
+      title: string;
+      body: string;
+      url: string;
+      notificationType: NotificationType;
+      status: "failed";
+    }> = [];
+
     for (const subscription of subscriptions) {
       try {
-        const subscriptionInfo = {
-          endpoint: subscription.endpoint,
-          keys: {
-            p256dh: subscription.p256dh,
-            auth: subscription.auth,
+        await webpush.sendNotification(
+          {
+            endpoint: subscription.endpoint,
+            keys: { p256dh: subscription.p256dh, auth: subscription.auth },
           },
-        };
-
-        await webpush.sendNotification(subscriptionInfo, payload);
+          payload,
+        );
         results.success += 1;
-
-        // 成功ログを保存
-        await prisma.pushNotificationLog.create({
-          data: {
-            userId,
-            title,
-            body,
-            url,
-            notificationType,
-            status: "sent",
-          },
-        });
+        successLogs.push({ userId, title, body, url, notificationType, status: "sent" });
       } catch (error) {
         console.error("Web push error:", error);
         results.failed += 1;
-
         const errorMsg =
           error instanceof Error ? error.message : "Unknown push error";
         results.errors.push(errorMsg);
-
-        // 無効なサブスクリプションの場合は削除
-        if (error) {
-          await prisma.pushSubscription.delete({
-            where: { id: subscription.id },
-          });
-          results.errors.push(
-            `Invalid subscription removed: ${subscription.endpoint.slice(
-              0,
-              50,
-            )}...`,
-          );
-        }
-
-        // エラーログを保存
-        await prisma.pushNotificationLog.create({
-          data: {
-            userId,
-            title,
-            body,
-            url,
-            notificationType,
-            status: "failed",
-          },
-        });
+        invalidSubscriptionIds.push(subscription.id);
+        results.errors.push(
+          `Invalid subscription removed: ${subscription.endpoint.slice(0, 50)}...`,
+        );
+        errorLogs.push({ userId, title, body, url, notificationType, status: "failed" });
       }
     }
+
+    const dbOps: Promise<unknown>[] = [];
+    if (successLogs.length > 0) {
+      dbOps.push(prisma.pushNotificationLog.createMany({ data: successLogs }));
+    }
+    if (invalidSubscriptionIds.length > 0) {
+      dbOps.push(
+        prisma.pushSubscription.deleteMany({
+          where: { id: { in: invalidSubscriptionIds } },
+        }),
+      );
+    }
+    if (errorLogs.length > 0) {
+      dbOps.push(prisma.pushNotificationLog.createMany({ data: errorLogs }));
+    }
+    await Promise.all(dbOps);
   } catch (error) {
     const errorMsg =
       error instanceof Error
@@ -480,21 +490,22 @@ export const triggerLectureStartNotifications = async ({
 
   const totals = { success: 0, failed: 0, errors: [] as string[] };
 
-  for (const [userId, lectureNames] of groupedLectureNames.entries()) {
-    const alreadySent = await prisma.pushNotificationLog.findFirst({
-      where: {
-        userId,
-        notificationType: "lecture",
-        status: "sent",
-        sentAt: {
-          gte: minuteStart,
-          lt: minuteEnd,
+  const alreadySentSet = new Set(
+    (
+      await prisma.pushNotificationLog.findMany({
+        where: {
+          userId: { in: Array.from(groupedLectureNames.keys()) },
+          notificationType: "lecture",
+          status: "sent",
+          sentAt: { gte: minuteStart, lt: minuteEnd },
         },
-      },
-      select: { id: true },
-    });
+        select: { userId: true },
+      })
+    ).map(log => log.userId),
+  );
 
-    if (alreadySent) {
+  for (const [userId, lectureNames] of groupedLectureNames.entries()) {
+    if (alreadySentSet.has(userId)) {
       continue;
     }
 
@@ -596,6 +607,21 @@ export const triggerTaskReminderNotifications = async ({
     },
   });
 
+  const candidateUserIds = [...new Set(candidateTasks.map(t => t.userId))];
+  const taskSubRows = await prisma.pushSubscription.findMany({
+    where: { userId: { in: candidateUserIds }, taskReminders: true },
+    select: { id: true, userId: true, endpoint: true, p256dh: true, auth: true },
+  });
+  const taskSubsByUser = new Map<
+    string,
+    Array<{ id: string; endpoint: string; p256dh: string; auth: string }>
+  >();
+  for (const sub of taskSubRows) {
+    const subs = taskSubsByUser.get(sub.userId) ?? [];
+    subs.push(sub);
+    taskSubsByUser.set(sub.userId, subs);
+  }
+
   const deliveriesToCreate: {
     taskId: string;
     userId: string;
@@ -650,6 +676,7 @@ export const triggerTaskReminderNotifications = async ({
         body,
         url: "/tasks",
         notificationType: "task",
+        preloadedSubscriptions: taskSubsByUser.get(task.userId) ?? [],
       });
 
       totals.success += result.success;
@@ -732,10 +759,33 @@ export const sendBulkPushNotification = async ({
     targetUserIds = userIds;
   }
 
+  const bulkSubWhere: Record<string, unknown> = {
+    userId: { in: targetUserIds },
+  };
+  if (notificationType === "task") bulkSubWhere.taskReminders = true;
+  else if (notificationType === "lecture") bulkSubWhere.lectureStarts = true;
+  else if (notificationType === "system") bulkSubWhere.systemNotices = true;
+
+  const bulkSubRows = await prisma.pushSubscription.findMany({
+    where: bulkSubWhere,
+    select: { id: true, userId: true, endpoint: true, p256dh: true, auth: true },
+  });
+  const bulkSubsByUser = new Map<
+    string,
+    Array<{ id: string; endpoint: string; p256dh: string; auth: string }>
+  >();
+  for (const sub of bulkSubRows) {
+    const subs = bulkSubsByUser.get(sub.userId) ?? [];
+    subs.push(sub);
+    bulkSubsByUser.set(sub.userId, subs);
+  }
+
   const totalResults = { success: 0, failed: 0, errors: [] as string[] };
 
-  // 各ユーザーに通知を送信
   for (const userId of targetUserIds) {
+    const subs = bulkSubsByUser.get(userId);
+    if (!subs || subs.length === 0) continue;
+
     try {
       const result = await sendPushNotification({
         userId,
@@ -743,6 +793,7 @@ export const sendBulkPushNotification = async ({
         body,
         url,
         notificationType,
+        preloadedSubscriptions: subs,
       });
 
       totalResults.success += result.success;

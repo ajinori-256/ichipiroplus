@@ -227,6 +227,13 @@ export const getLectureById = async (lectureId: string): Promise<Lecture> => {
   return lecture;
 };
 
+export const getLecturesByIds = async (lectureIds: string[]): Promise<Lecture[]> => {
+  if (lectureIds.length === 0) return [];
+  return await prisma.lecture.findMany({
+    where: { id: { in: lectureIds } },
+  });
+};
+
 export const getLectureCatalogDetail = async (
   lectureId: string,
 ): Promise<LectureCatalogDetail> => {

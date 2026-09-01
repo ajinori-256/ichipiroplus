@@ -130,14 +130,27 @@ export const copyTimetableFromUser = async (
   });
   const existingLectureIds = new Set(existing.map(r => r.lectureId));
 
-  let created = 0;
-  let updated = 0;
+  const toCreate = sourceRegistrations.filter(
+    r => !existingLectureIds.has(r.lectureId),
+  );
+  const toUpdate = sourceRegistrations.filter(r =>
+    existingLectureIds.has(r.lectureId),
+  );
 
   await prisma.$transaction(async tx => {
-    for (const source of sourceRegistrations) {
-      const alreadyRegistered = existingLectureIds.has(source.lectureId);
+    if (toCreate.length > 0) {
+      await tx.registration.createMany({
+        data: toCreate.map(r => ({
+          userId: targetUserId,
+          lectureId: r.lectureId,
+          academicYear: term.academicYear,
+          attendanceCount: r.attendanceCount,
+        })),
+      });
+    }
 
-      await tx.registration.upsert({
+    for (const source of toUpdate) {
+      await tx.registration.update({
         where: {
           userId_lectureId_academicYear: {
             userId: targetUserId,
@@ -145,28 +158,14 @@ export const copyTimetableFromUser = async (
             academicYear: term.academicYear,
           },
         },
-        create: {
-          userId: targetUserId,
-          lectureId: source.lectureId,
-          academicYear: term.academicYear,
-          attendanceCount: source.attendanceCount,
-        },
-        update: {
-          attendanceCount: source.attendanceCount,
-        },
+        data: { attendanceCount: source.attendanceCount },
       });
-
-      if (alreadyRegistered) {
-        updated += 1;
-      } else {
-        created += 1;
-      }
     }
   });
 
   return {
-    created,
-    updated,
+    created: toCreate.length,
+    updated: toUpdate.length,
     total: sourceRegistrations.length,
   };
 };

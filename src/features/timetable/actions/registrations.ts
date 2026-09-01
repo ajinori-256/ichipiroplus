@@ -38,6 +38,32 @@ export const getMyRegistrations = async (
 };
 
 /**
+ * ユーザーの登録済み講義を講義名付きで取得（SelectItem 生成用）
+ */
+export const getMyRegistrationsWithLectureName = async (
+  term: { id: string; number: number; academicYear: number },
+) => {
+  const userId = await getMe();
+
+  return prisma.registration.findMany({
+    where: {
+      userId,
+      academicYear: term.academicYear,
+      lecture: {
+        lectureTerms: {
+          some: { termNumber: term.number },
+        },
+      },
+    },
+    select: {
+      id: true,
+      lecture: { select: { name: true } },
+    },
+    orderBy: { registeredAt: "desc" },
+  });
+};
+
+/**
  * 特定の時間帯の登録済み講義を取得
  */
 export const getRegistrationsBySchedule = async (
